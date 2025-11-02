@@ -1,0 +1,17 @@
+langchain
+langchain-community
+langchain-openai
+langchain-core
+dashscope
+neo4j
+langchain-neo4j
+gradio
+tenacity
+pydantic<3,>2
+python-dotenv
+faker       # 新增
+openpyxl    # 新增
+tqdm        # 下一步会用到，提前加上
+pypdf                # 新增
+faiss-cpu            # 新增
+langchain-text-splitters # 新增
