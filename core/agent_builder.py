@@ -1,7 +1,8 @@
 # core/agent_builder.py
 
-from langchain.agents import AgentType, initialize_agent
-from langchain.memory import ConversationBufferWindowMemory
+from langchain_classic.agents.agent_types import AgentType
+from langchain_classic.agents.initialize import initialize_agent
+from langchain_classic.memory.buffer_window import ConversationBufferWindowMemory
 
 # 从同级目录导入
 from .llm_services import llm

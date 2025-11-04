@@ -4,7 +4,7 @@ langchain-openai
 langchain-core
 dashscope
 neo4j
-langchain-neo4j
+#langchain-neo4j
 gradio
 tenacity
 pydantic<3,>2
@@ -15,3 +15,5 @@ tqdm        # 下一步会用到，提前加上
 pypdf                # 新增
 faiss-cpu            # 新增
 langchain-text-splitters # 新增
+sentence-transformers # 新增
+langchain_neo4j

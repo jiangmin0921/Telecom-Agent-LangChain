@@ -1,15 +1,15 @@
 # core/tool_builder.py
 
 import os
-from dotenv import load_dotenv
 
-from langchain.agents import Tool
-from langchain.chains import GraphCypherQAChain, RetrievalQA
-from langchain_community.graphs import Neo4jGraph
-from langchain_community.vectorstores import FAISS
+from dotenv import load_dotenv
+from langchain_core.tools.simple import Tool
+from langchain_classic.chains.retrieval_qa.base import RetrievalQA
+from langchain_community.chains.graph_qa.cypher import GraphCypherQAChain
+from langchain_neo4j import Neo4jGraph
 
 # 从同级目录导入模型
-from .llm_services import llm, embeddings
+from .llm_services import llm
 
 # 加载数据库环境变量
 load_dotenv()
