@@ -1,110 +1,298 @@
-# ui/gradio_app.py
-
+import hashlib
 import os
+import shutil
+import traceback
+from typing import Any, Dict, Generator, Optional, Tuple
+
 import gradio as gr
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
 from langchain_community.vectorstores import FAISS
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # 从上级目录导入
 from core.agent_builder import build_agent
 from core.llm_services import embeddings
 
-# 使用一个字典来管理应用的状态，主要是agent和retriever
-app_state = {
-    "rag_retriever": None,
-    "agent_executor": None,
-}
 
-# 初始化一个没有RAG能力的agent
-app_state["agent_executor"] = build_agent(None)
+def _default_session_state() -> Dict[str, Any]:
+    return {
+        "rag_retriever": None,
+        "agent_executor": build_agent(None),
+        "last_index_cache_dir": None,
+        "last_file_key": None,
+    }
 
 
-def process_uploaded_file(file_obj):
-    """处理上传的文件，创建RAG检索器并更新Agent"""
+def _get_default_base_cache_dir() -> str:
+    env_dir = os.getenv("RAG_FAISS_DIR")
+    if env_dir and env_dir.strip():
+        return os.path.expanduser(env_dir.strip())
+    return os.path.join(os.path.expanduser("~"), ".rag_faiss_cache")
+
+
+def _get_base_cache_dir(persist_dir_text: Optional[str]) -> str:
+    base = (persist_dir_text or "").strip()
+    if base:
+        return os.path.expanduser(base)
+    return _get_default_base_cache_dir()
+
+
+def _file_cache_key(file_path: str) -> str:
+    try:
+        stat = os.stat(file_path)
+        raw = f"{os.path.abspath(file_path)}::{stat.st_size}::{int(stat.st_mtime)}"
+    except Exception:
+        raw = os.path.abspath(file_path)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _embeddings_fingerprint(obj: Any) -> str:
+    parts = [type(obj).__name__]
+    for attr in [
+        "model",
+        "model_name",
+        "deployment",
+        "deployment_name",
+        "base_url",
+        "endpoint",
+        "encoding",
+        "dimension",
+    ]:
+        val = getattr(obj, attr, None)
+        if val is not None:
+            parts.append(f"{attr}={val}")
+    try:
+        parts.append(repr(obj))
+    except Exception:
+        pass
+    data = "|".join(parts).encode("utf-8", errors="ignore")
+    return hashlib.sha1(data).hexdigest()
+
+
+def _faiss_cache_dir_for(file_key: str, emb_fp: str, base_dir: str) -> str:
+    base = base_dir
+    os.makedirs(base, exist_ok=True)
+    # 目录名包含 embeddings 指纹，避免 embeddings 变化导致错配
+    return os.path.join(base, f"{file_key}__{emb_fp[:12]}")
+
+
+def _try_load_faiss_from_cache(cache_dir: str) -> Optional[FAISS]:
+    try:
+        if os.path.isdir(cache_dir):
+            return FAISS.load_local(cache_dir, embeddings, allow_dangerous_deserialization=True)
+    except Exception:
+        traceback.print_exc()
+    return None
+
+
+def _save_faiss_to_cache(cache_dir: str, vs: FAISS) -> None:
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        vs.save_local(cache_dir)
+    except Exception:
+        traceback.print_exc()
+
+
+def _safe_clear_directory(dir_path: str) -> None:
+    try:
+        if not os.path.isdir(dir_path):
+            return
+        # 尝试整体删除；失败则逐项删除
+        try:
+            shutil.rmtree(dir_path)
+        except Exception:
+            for name in os.listdir(dir_path):
+                p = os.path.join(dir_path, name)
+                try:
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        os.remove(p)
+                except Exception:
+                    traceback.print_exc()
+        # 重新创建空目录
+        os.makedirs(dir_path, exist_ok=True)
+    except Exception:
+        traceback.print_exc()
+
+
+def process_uploaded_file(
+    file_obj,
+    state: Dict[str, Any],
+    chunk_size: int,
+    chunk_overlap: int,
+    top_k: int,
+    persist_dir_text: str,
+) -> Generator[Tuple[str, Any, Dict[str, Any]], None, None]:
     if not file_obj:
-        yield "请先上传一个文件。", gr.update(interactive=False)
+        yield "请先上传一个文件。", gr.update(interactive=False), state
+        return
 
     try:
         file_path = file_obj.name
         file_ext = os.path.splitext(file_path)[1].lower()
-        yield "开始处理文件...", gr.update(interactive=False)
+        yield "开始处理文件...", gr.update(interactive=False), state
 
-        if file_ext == '.pdf':
+        if file_ext == ".pdf":
             loader = PyPDFLoader(file_path)
-        elif file_ext == '.txt':
-            loader = TextLoader(file_path, encoding='utf-8')
+        elif file_ext == ".txt":
+            loader = TextLoader(file_path, encoding="utf-8")
+        elif file_ext == ".docx":
+            loader = Docx2txtLoader(file_path)
         else:
-            yield f"不支持的文件格式: {file_ext}", gr.update(interactive=True)
+            yield f"不支持的文件格式: {file_ext}", gr.update(interactive=True), state
             return
 
-        yield "1/4: 正在加载文档...", gr.update(interactive=False)
-        documents = loader.load()
+        try:
+            size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            if size_mb > 50:
+                yield f"提示：文件较大（约{size_mb:.1f}MB），处理可能需要较长时间。", gr.update(interactive=False), state
+        except Exception:
+            pass
 
-        yield "2/4: 正在切分文本...", gr.update(interactive=False)
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        chunks = text_splitter.split_documents(documents)
-        if not chunks:
-            yield "未能从文档中提取任何文本内容。", gr.update(interactive=True)
-            return
+        base_cache_dir = _get_base_cache_dir(persist_dir_text)
+        emb_fp = _embeddings_fingerprint(embeddings)
+        file_key = _file_cache_key(file_path)
+        cache_dir = _faiss_cache_dir_for(file_key, emb_fp, base_cache_dir)
 
-        yield "3/4: 正在创建向量索引...", gr.update(interactive=False)
-        vector_store = FAISS.from_documents(chunks, embeddings)
-        app_state["rag_retriever"] = vector_store.as_retriever(search_kwargs={"k": 3})
+        vs = _try_load_faiss_from_cache(cache_dir)
+        if vs:
+            yield "1/3: 已从缓存加载向量索引。", gr.update(interactive=False), state
+        else:
+            yield "1/3: 正在加载文档...", gr.update(interactive=False), state
+            documents = loader.load()
 
-        yield "4/4: 正在更新智能体...", gr.update(interactive=False)
-        app_state["agent_executor"] = build_agent(app_state["rag_retriever"])
+            yield "2/3: 正在切分文本...", gr.update(interactive=False), state
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=chunk_size, chunk_overlap=chunk_overlap
+            )
+            chunks = splitter.split_documents(documents)
+            if not chunks:
+                yield "未能从文档中提取任何文本内容。", gr.update(interactive=True), state
+                return
 
-        yield f"文件 '{os.path.basename(file_path)}' 处理成功！", gr.update(interactive=True)
+            yield "3/3: 正在创建向量索引...", gr.update(interactive=False), state
+            vs = FAISS.from_documents(chunks, embeddings)
+            _save_faiss_to_cache(cache_dir, vs)
+
+        state["rag_retriever"] = vs.as_retriever(search_kwargs={"k": int(top_k)})
+        state["agent_executor"] = build_agent(state["rag_retriever"])
+        state["last_index_cache_dir"] = cache_dir
+        state["last_file_key"] = file_key
+
+        yield f"文件 '{os.path.basename(file_path)}' 处理成功！", gr.update(interactive=True), state
 
     except Exception as e:
-        print(f"处理文件时发生错误: {e}")
-        yield f"处理失败: {e}", gr.update(interactive=True)
+        traceback.print_exc()
+        yield f"处理失败: {e}", gr.update(interactive=True), state
 
 
-def chat_with_agent(question, history):
-    """与Agent进行对话的主函数"""
-    agent = app_state.get("agent_executor")
+def chat_with_agent(question: str, history: list, state: Dict[str, Any]) -> str:
+    agent = state.get("agent_executor")
     if not agent:
-        return "Agent尚未初始化。请重启应用。"
-
+        return "Agent尚未初始化。请重试或刷新页面。"
     try:
         response = agent.invoke({"input": question})
-        return response.get('output', '抱歉，我没有得到有效的回答。')
+        return response.get("output", "抱歉，我没有得到有效的回答。")
     except Exception as e:
-        print(f"与Agent对话时发生错误: {e}")
+        traceback.print_exc()
         return f"发生错误: {e}"
 
 
+def clear_cache(persist_dir_text: str, state: Dict[str, Any]):
+    try:
+        base_cache_dir = _get_base_cache_dir(persist_dir_text)
+        _safe_clear_directory(base_cache_dir)
+        # 重置会话中的 RAG 状态
+        state["rag_retriever"] = None
+        state["agent_executor"] = build_agent(None)
+        state["last_index_cache_dir"] = None
+        state["last_file_key"] = None
+        return "缓存已清理，Agent 已重置为无RAG模式。", state
+    except Exception as e:
+        traceback.print_exc()
+        return f"清理缓存失败: {e}", state
+
+
 def build_ui():
-    """构建Gradio界面"""
     with gr.Blocks(theme=gr.themes.Soft(), title="电信行业智能对话系统") as demo:
+        session_state = gr.State(_default_session_state())
+
         gr.Markdown("# 电信行业智能对话系统由LangChain + 通义千问 + Neo4j + RAG驱动")
 
         with gr.Row():
             with gr.Column(scale=1):
                 gr.Markdown("### ▲ 上传业务文档")
-                file_uploader = gr.File(label="选择或拖拽文件 (支持TXT/PDF)", file_types=['.txt', '.pdf'])
-                process_button = gr.Button("处理上传的文件", variant="primary")
-                status_display = gr.Textbox(label="文件处理状态", interactive=False, value="等待上传文件...")
 
+                file_uploader = gr.File(
+                    label="选择或拖拽文件 (支持TXT/PDF/DOCX)", file_types=[".txt", ".pdf", ".docx"]
+                )
+
+                with gr.Row():
+                    chunk_size = gr.Slider(
+                        minimum=200,
+                        maximum=2000,
+                        value=500,
+                        step=50,
+                        label="切分片段大小 (chunk_size)",
+                    )
+                    chunk_overlap = gr.Slider(
+                        minimum=0,
+                        maximum=400,
+                        value=50,
+                        step=10,
+                        label="切分重叠 (chunk_overlap)",
+                    )
+
+                top_k = gr.Slider(
+                    minimum=1,
+                    maximum=10,
+                    value=3,
+                    step=1,
+                    label="检索条数 (top_k)",
+                )
+
+                with gr.Accordion("高级设置", open=False):
+                    persist_dir = gr.Textbox(
+                        label="索引持久化目录 (留空使用 RAG_FAISS_DIR 或 ~/.rag_faiss_cache)",
+                        value=_get_default_base_cache_dir(),
+                    )
+                    clear_cache_btn = gr.Button("清理缓存", variant="secondary")
+
+                process_button = gr.Button("处理上传的文件", variant="primary")
+                status_display = gr.Textbox(
+                    label="文件处理状态", interactive=False, value="等待上传文件..."
+                )
 
         with gr.Column(scale=2):
             gr.Markdown("### 对话窗口")
+
         gr.ChatInterface(
             fn=chat_with_agent,
             chatbot=gr.Chatbot(height=500),
-            textbox=gr.Textbox(placeholder="输入您的问题，例如：'王伟的套餐是什么？'", container=False, scale=7),
+            textbox=gr.Textbox(
+                placeholder="输入您的问题，例如：'王伟的套餐是什么？'", container=False, scale=7
+            ),
             title=None,
             submit_btn="发送",
             retry_btn=None,
             undo_btn=None,
             clear_btn="清除对话历史",
+            additional_inputs=[session_state],
         )
 
         process_button.click(
             fn=process_uploaded_file,
-            inputs=[file_uploader],
-            outputs=[status_display, process_button]
+            inputs=[file_uploader, session_state, chunk_size, chunk_overlap, top_k, persist_dir],
+            outputs=[status_display, process_button, session_state],
         )
+
+        clear_cache_btn.click(
+            fn=clear_cache,
+            inputs=[persist_dir, session_state],
+            outputs=[status_display, session_state],
+        )
+
+        demo.queue(concurrency_count=4, status_update_rate=0.2)
+
     return demo
