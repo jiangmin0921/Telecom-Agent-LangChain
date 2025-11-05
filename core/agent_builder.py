@@ -15,7 +15,14 @@ def build_agent(rag_retriever=None):
     :param rag_retriever: 从FAISS创建的 retriever 对象，可以为 None。
     :return: 一个 Agent Executor 实例。
     """
-    tools = [get_graph_tool(), get_general_chat_tool()]
+    tools = []
+    # 图谱工具是可选的，失败时不阻断整体Agent
+    try:
+        tools.append(get_graph_tool())
+    except Exception as e:
+        print(f"图谱工具加载失败，已跳过。原因: {e}")
+
+    tools.append(get_general_chat_tool())
 
     if rag_retriever:
         rag_tool = get_rag_tool(rag_retriever)

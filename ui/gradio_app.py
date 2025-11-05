@@ -17,7 +17,7 @@ from core.llm_services import embeddings
 def _default_session_state() -> Dict[str, Any]:
     return {
         "rag_retriever": None,
-        "agent_executor": build_agent(None),
+        "agent_executor": None,
         "last_index_cache_dir": None,
         "last_file_key": None,
     }
@@ -190,7 +190,12 @@ def process_uploaded_file(
 def chat_with_agent(question: str, history: list, state: Dict[str, Any]) -> str:
     agent = state.get("agent_executor")
     if not agent:
-        return "Agent尚未初始化。请重试或刷新页面。"
+        try:
+            agent = build_agent(state.get("rag_retriever"))
+            state["agent_executor"] = agent
+        except Exception as e:
+            traceback.print_exc()
+            return f"Agent初始化失败: {e}"
     try:
         response = agent.invoke({"input": question})
         return response.get("output", "抱歉，我没有得到有效的回答。")
@@ -269,15 +274,12 @@ def build_ui():
 
         gr.ChatInterface(
             fn=chat_with_agent,
-            chatbot=gr.Chatbot(height=500),
+            chatbot=gr.Chatbot(height=500, type="messages"),
             textbox=gr.Textbox(
                 placeholder="输入您的问题，例如：'王伟的套餐是什么？'", container=False, scale=7
             ),
             title=None,
             submit_btn="发送",
-            retry_btn=None,
-            undo_btn=None,
-            clear_btn="清除对话历史",
             additional_inputs=[session_state],
         )
 
@@ -293,6 +295,6 @@ def build_ui():
             outputs=[status_display, session_state],
         )
 
-        demo.queue(concurrency_count=4, status_update_rate=0.2)
+        demo.queue()
 
     return demo

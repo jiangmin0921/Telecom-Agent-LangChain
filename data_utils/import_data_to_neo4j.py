@@ -31,6 +31,7 @@ class Neo4jImporter:
 
     def import_data(self, excel_path='telecom_data.xlsx'):
         """从Excel文件导入数据到Neo4j"""
+        global importer
         try:
             df = pd.read_excel(excel_path)
         except FileNotFoundError:
