@@ -1,4 +1,5 @@
 import os
+import argparse
 import pandas as pd
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
@@ -17,6 +18,9 @@ class Neo4jImporter:
     def __init__(self, uri, user, password):
         # 初始化数据库驱动
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
+        # 尝试验证连接以尽早失败
+        with self.driver.session() as session:
+            session.run("RETURN 1")
 
     def close(self):
         # 关闭数据库连接
@@ -29,9 +33,10 @@ class Neo4jImporter:
             session.run("MATCH (n) DETACH DELETE n")
             print("数据库已清空。")
 
-    def import_data(self, excel_path='telecom_data.xlsx'):
+    def import_data(self, excel_path=None):
         """从Excel文件导入数据到Neo4j"""
-        global importer
+        # 解析Excel路径（支持参数、环境变量与常见默认位置）
+        excel_path = resolve_excel_path(excel_path)
         try:
             df = pd.read_excel(excel_path)
         except FileNotFoundError:
@@ -72,16 +77,68 @@ class Neo4jImporter:
 
         print("数据导入成功！")
 
-        if __name__ == '__main__':
-            importer = Neo4jImporter(NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD)
+def resolve_excel_path(excel_path_arg=None):
+    """按照优先级解析 Excel 路径，并在常见位置进行回退查找。"""
+    # 1) 命令行参数优先
+    if excel_path_arg and os.path.isfile(excel_path_arg):
+        return excel_path_arg
 
-        # 步骤1: 清空数据库 (可选，如果你想从一个干净的状态开始)
-        # 在第一次运行时，建议执行此操作。
-        importer.clear_database()
+    # 2) 环境变量
+    env_path = os.getenv('TELECOM_EXCEL_PATH')
+    if env_path and os.path.isfile(env_path):
+        return env_path
 
-        # 步骤2: 导入数据
-        importer.import_data()
+    # 3) 常见默认路径集合
+    candidates = []
+    script_dir = os.path.dirname(__file__)
+    project_root = os.path.abspath(os.path.join(script_dir, os.pardir))
+    cwd = os.getcwd()
 
-        # 步骤3: 关闭连接
+    for base in [
+        script_dir,
+        project_root,
+        cwd,
+        os.path.join(project_root, 'data'),
+        os.path.join(cwd, 'data'),
+    ]:
+        candidates.append(os.path.join(base, 'telecom_data.xlsx'))
+
+    for path in candidates:
+        if os.path.isfile(path):
+            print(f"已解析 Excel 路径: {path}")
+            return path
+
+    # 未找到，返回一个合理的默认值（供错误消息显示）
+    # 默认同脚本目录
+    default_path = os.path.join(script_dir, 'telecom_data.xlsx')
+    print("未能在常见位置找到 'telecom_data.xlsx'。"
+          " 可通过 --excel 或 TELECOM_EXCEL_PATH 指定，"
+          f" 或将文件放置到以下任意位置之一: {candidates}")
+    return default_path
+
+
+if __name__ == '__main__':
+    # 校验环境变量
+    if not all([NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD]):
+        raise ValueError("Neo4j 数据库连接信息未在 .env 文件中完全设置: 请设置 NEO4J_URI/NEO4J_USERNAME/NEO4J_PASSWORD")
+
+    # 参数与环境变量
+    parser = argparse.ArgumentParser(description='Import telecom Excel data into Neo4j.')
+    parser.add_argument('--excel', type=str, default=None, help='Path to telecom_data.xlsx')
+    parser.add_argument('--clear-first', action='store_true', help='Clear database before import')
+    args = parser.parse_args()
+
+    # 允许通过环境变量控制是否清库
+    clear_first_env = os.getenv('NEO4J_CLEAR_FIRST', 'false').lower() in ['1', 'true', 'yes']
+    clear_first = args.clear_first or clear_first_env
+
+    importer = Neo4jImporter(NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD)
+
+    try:
+        if clear_first:
+            importer.clear_database()
+
+        importer.import_data(excel_path=args.excel)
+    finally:
         importer.close()
 
