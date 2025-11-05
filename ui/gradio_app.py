@@ -1,11 +1,12 @@
 import hashlib
 import os
 import shutil
+import tempfile
 import traceback
 from typing import Any, Dict, Generator, Optional, Tuple
 
 import gradio as gr
-from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
+from langchain_community.document_loaders import TextLoader, Docx2txtLoader
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -20,6 +21,7 @@ def _default_session_state() -> Dict[str, Any]:
         "agent_executor": None,
         "last_index_cache_dir": None,
         "last_file_key": None,
+        "agent_built_for_file_key": None,
     }
 
 
@@ -74,6 +76,158 @@ def _faiss_cache_dir_for(file_key: str, emb_fp: str, base_dir: str) -> str:
     os.makedirs(base, exist_ok=True)
     # 目录名包含 embeddings 指纹，避免 embeddings 变化导致错配
     return os.path.join(base, f"{file_key}__{emb_fp[:12]}")
+def _ocr_pdf_to_temp(input_pdf_path: str) -> Optional[str]:
+    """Try to OCR a PDF to a temporary searchable PDF. Returns path or None.
+    Uses ocrmypdf Python API if available, else tries the `ocrmypdf` CLI.
+    """
+    try:
+        # Prefer Python API if installed
+        import ocrmypdf  # type: ignore
+        tmp_dir = tempfile.mkdtemp(prefix="ocrpdf_")
+        output_pdf_path = os.path.join(tmp_dir, "ocr_output.pdf")
+        try:
+            ocrmypdf.ocr(
+                input_file=input_pdf_path,
+                output_file=output_pdf_path,
+                force_ocr=True,
+                deskew=True,
+                optimize=1,
+                progress_bar=False,
+            )
+            if os.path.isfile(output_pdf_path) and os.path.getsize(output_pdf_path) > 0:
+                return output_pdf_path
+        except Exception:
+            traceback.print_exc()
+    except Exception:
+        pass
+
+    # Fallback to CLI if available
+    try:
+        import shutil as _sh
+        if _sh.which("ocrmypdf"):
+            tmp_dir = tempfile.mkdtemp(prefix="ocrpdf_")
+            output_pdf_path = os.path.join(tmp_dir, "ocr_output.pdf")
+            import subprocess
+            cmd = [
+                "ocrmypdf",
+                "--force-ocr",
+                "--deskew",
+                "--optimize", "1",
+                input_pdf_path,
+                output_pdf_path,
+            ]
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if os.path.isfile(output_pdf_path) and os.path.getsize(output_pdf_path) > 0:
+                    return output_pdf_path
+            except Exception:
+                traceback.print_exc()
+    except Exception:
+        pass
+
+    return None
+
+def _load_pdf_with_fallbacks(file_path: str):
+    """Load PDF documents using multiple strategies to handle scanned or tricky PDFs.
+    Returns a list[Document].
+    """
+    documents = []
+    # 1) Try PyPDFLoader
+    try:
+        try:
+            from langchain_community.document_loaders import PyPDFLoader
+        except Exception:
+            # fallback older path (some versions expose under .pdf)
+            from langchain_community.document_loaders.pdf import PyPDFLoader  # type: ignore
+        loader = PyPDFLoader(file_path)
+        documents = loader.load()
+        if documents:
+            return documents
+    except Exception:
+        traceback.print_exc()
+
+    # 2) Try PDFPlumberLoader if available
+    try:
+        from langchain_community.document_loaders import PDFPlumberLoader
+        loader = PDFPlumberLoader(file_path)
+        documents = loader.load()
+        if documents:
+            return documents
+    except Exception:
+        pass
+
+    # 3) Try PyMuPDFLoader (fitz) if available
+    try:
+        from langchain_community.document_loaders import PyMuPDFLoader
+        loader = PyMuPDFLoader(file_path)
+        documents = loader.load()
+        if documents:
+            return documents
+    except Exception:
+        pass
+
+    # 4) Lightweight fallback using pypdf directly
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(file_path)
+        texts = []
+        for page in reader.pages:
+            try:
+                txt = page.extract_text() or ""
+            except Exception:
+                txt = ""
+            if txt.strip():
+                texts.append(txt)
+        if texts:
+            # Minimal Document structure to be compatible with splitters
+            from langchain_core.documents import Document
+            return [Document(page_content=t) for t in texts]
+    except Exception:
+        pass
+
+    # 5) Try OCR to make it searchable, then reload
+    try:
+        ocr_path = _ocr_pdf_to_temp(file_path)
+        if ocr_path:
+            # Re-run fast loaders on OCR'd PDF
+            try:
+                from langchain_community.document_loaders import PDFPlumberLoader
+                loader = PDFPlumberLoader(ocr_path)
+                documents = loader.load()
+                if documents:
+                    return documents
+            except Exception:
+                pass
+            try:
+                from langchain_community.document_loaders import PyPDFLoader
+                loader = PyPDFLoader(ocr_path)
+                documents = loader.load()
+                if documents:
+                    return documents
+            except Exception:
+                pass
+            # Fallback again to pypdf
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(ocr_path)
+                texts = []
+                for page in reader.pages:
+                    try:
+                        txt = page.extract_text() or ""
+                    except Exception:
+                        txt = ""
+                    if txt.strip():
+                        texts.append(txt)
+                if texts:
+                    from langchain_core.documents import Document
+                    return [Document(page_content=t) for t in texts]
+            except Exception:
+                pass
+    except Exception:
+        traceback.print_exc()
+
+    return []
+
 
 
 def _try_load_faiss_from_cache(cache_dir: str) -> Optional[FAISS]:
@@ -125,7 +279,7 @@ def process_uploaded_file(
     persist_dir_text: str,
 ) -> Generator[Tuple[str, Any, Dict[str, Any]], None, None]:
     if not file_obj:
-        yield "请先上传一个文件。", gr.update(interactive=False), state
+        yield "请先上传一个文件。", gr.update(interactive=True), state
         return
 
     try:
@@ -134,7 +288,16 @@ def process_uploaded_file(
         yield "开始处理文件...", gr.update(interactive=False), state
 
         if file_ext == ".pdf":
-            loader = PyPDFLoader(file_path)
+            # Use robust PDF loaders with fallbacks
+            documents = _load_pdf_with_fallbacks(file_path)
+            if not documents:
+                yield (
+                    "未能从PDF中提取文本。该文件可能为扫描版图片或受保护的PDF。"
+                    " 可尝试：1) 转为可复制文本的PDF，2) 使用OCR工具（如OCRmyPDF）预处理后再上传。",
+                    gr.update(interactive=True),
+                    state,
+                )
+                return
         elif file_ext == ".txt":
             loader = TextLoader(file_path, encoding="utf-8")
         elif file_ext == ".docx":
@@ -160,7 +323,8 @@ def process_uploaded_file(
             yield "1/3: 已从缓存加载向量索引。", gr.update(interactive=False), state
         else:
             yield "1/3: 正在加载文档...", gr.update(interactive=False), state
-            documents = loader.load()
+            if file_ext != ".pdf":
+                documents = loader.load()
 
             yield "2/3: 正在切分文本...", gr.update(interactive=False), state
             splitter = RecursiveCharacterTextSplitter(
@@ -168,7 +332,11 @@ def process_uploaded_file(
             )
             chunks = splitter.split_documents(documents)
             if not chunks:
-                yield "未能从文档中提取任何文本内容。", gr.update(interactive=True), state
+                yield (
+                    "未能从文档中提取任何文本内容。若为扫描版PDF，请先进行OCR处理（例如使用OCRmyPDF）后再尝试。",
+                    gr.update(interactive=True),
+                    state,
+                )
                 return
 
             yield "3/3: 正在创建向量索引...", gr.update(interactive=False), state
@@ -179,6 +347,7 @@ def process_uploaded_file(
         state["agent_executor"] = build_agent(state["rag_retriever"])
         state["last_index_cache_dir"] = cache_dir
         state["last_file_key"] = file_key
+        state["agent_built_for_file_key"] = file_key
 
         yield f"文件 '{os.path.basename(file_path)}' 处理成功！", gr.update(interactive=True), state
 
@@ -189,10 +358,22 @@ def process_uploaded_file(
 
 def chat_with_agent(question: str, history: list, state: Dict[str, Any]) -> str:
     agent = state.get("agent_executor")
-    if not agent:
+    retriever = state.get("rag_retriever")
+    last_file_key = state.get("last_file_key")
+    built_for_key = state.get("agent_built_for_file_key")
+
+    needs_rebuild = False
+    if agent is None:
+        needs_rebuild = True
+    elif last_file_key and last_file_key != built_for_key:
+        # 文件变化，需重建以启用最新RAG
+        needs_rebuild = True
+
+    if needs_rebuild:
         try:
-            agent = build_agent(state.get("rag_retriever"))
+            agent = build_agent(retriever)
             state["agent_executor"] = agent
+            state["agent_built_for_file_key"] = last_file_key
         except Exception as e:
             traceback.print_exc()
             return f"Agent初始化失败: {e}"
