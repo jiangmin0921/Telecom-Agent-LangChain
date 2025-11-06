@@ -279,68 +279,93 @@ def process_uploaded_file(
     persist_dir_text: str,
 ) -> Generator[Tuple[str, Any, Dict[str, Any]], None, None]:
     if not file_obj:
-        yield "请先上传一个文件。", gr.update(interactive=True), state
+        yield "请先上传文件（支持多选）。", gr.update(interactive=True), state
         return
 
     try:
-        file_path = file_obj.name
-        file_ext = os.path.splitext(file_path)[1].lower()
-        yield "开始处理文件...", gr.update(interactive=False), state
-
-        if file_ext == ".pdf":
-            # Use robust PDF loaders with fallbacks
-            documents = _load_pdf_with_fallbacks(file_path)
-            if not documents:
-                yield (
-                    "未能从PDF中提取文本。该文件可能为扫描版图片或受保护的PDF。"
-                    " 可尝试：1) 转为可复制文本的PDF，2) 使用OCR工具（如OCRmyPDF）预处理后再上传。",
-                    gr.update(interactive=True),
-                    state,
-                )
-                return
-        elif file_ext == ".txt":
-            loader = TextLoader(file_path, encoding="utf-8")
-        elif file_ext == ".docx":
-            loader = Docx2txtLoader(file_path)
-        else:
-            yield f"不支持的文件格式: {file_ext}", gr.update(interactive=True), state
-            return
-
-        try:
-            size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            if size_mb > 50:
-                yield f"提示：文件较大（约{size_mb:.1f}MB），处理可能需要较长时间。", gr.update(interactive=False), state
-        except Exception:
-            pass
+        # 统一为列表处理
+        files = file_obj if isinstance(file_obj, list) else [file_obj]
 
         base_cache_dir = _get_base_cache_dir(persist_dir_text)
         emb_fp = _embeddings_fingerprint(embeddings)
-        file_key = _file_cache_key(file_path)
-        cache_dir = _faiss_cache_dir_for(file_key, emb_fp, base_cache_dir)
+
+        # 多文件使用会话级合并目录；单文件仍使用文件特定目录
+        if len(files) > 1:
+            cache_dir = os.path.join(base_cache_dir, f"combined__{emb_fp[:12]}")
+            file_key = "combined"
+        else:
+            try:
+                single_path = files[0].name
+            except Exception:
+                single_path = str(files[0])
+            file_key = _file_cache_key(single_path)
+            cache_dir = _faiss_cache_dir_for(file_key, emb_fp, base_cache_dir)
 
         vs = _try_load_faiss_from_cache(cache_dir)
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size, chunk_overlap=chunk_overlap
+        )
+
+        total_chunks = 0
         if vs:
             yield "1/3: 已从缓存加载向量索引。", gr.update(interactive=False), state
         else:
             yield "1/3: 正在加载文档...", gr.update(interactive=False), state
-            if file_ext != ".pdf":
-                documents = loader.load()
 
-            yield "2/3: 正在切分文本...", gr.update(interactive=False), state
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=chunk_size, chunk_overlap=chunk_overlap
-            )
-            chunks = splitter.split_documents(documents)
-            if not chunks:
+            for f in files:
+                try:
+                    file_path = f.name
+                except Exception:
+                    file_path = str(f)
+                file_ext = os.path.splitext(file_path)[1].lower()
+
+                # 文件大小提示（尽力而为）
+                try:
+                    size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                    if size_mb > 50:
+                        yield f"提示：{os.path.basename(file_path)} 文件较大（约{size_mb:.1f}MB），处理可能较慢。", gr.update(interactive=False), state
+                except Exception:
+                    pass
+
+                # 加载
+                if file_ext == ".pdf":
+                    documents = _load_pdf_with_fallbacks(file_path)
+                    if not documents:
+                        continue
+                elif file_ext == ".txt":
+                    loader = TextLoader(file_path, encoding="utf-8")
+                    documents = loader.load()
+                elif file_ext == ".docx":
+                    loader = Docx2txtLoader(file_path)
+                    documents = loader.load()
+                else:
+                    yield f"跳过不支持的文件格式: {file_ext}", gr.update(interactive=False), state
+                    continue
+
+                # 切分
+                yield f"2/3: 正在切分 {os.path.basename(file_path)}...", gr.update(interactive=False), state
+                chunks = splitter.split_documents(documents)
+                if not chunks:
+                    continue
+                total_chunks += len(chunks)
+
+                # 建索引/追加
+                if vs is None:
+                    yield "3/3: 正在创建向量索引...", gr.update(interactive=False), state
+                    vs = FAISS.from_documents(chunks, embeddings)
+                else:
+                    yield f"3/3: 追加到向量索引（{os.path.basename(file_path)}）...", gr.update(interactive=False), state
+                    vs.add_documents(chunks)
+
+            if vs is None:
                 yield (
-                    "未能从文档中提取任何文本内容。若为扫描版PDF，请先进行OCR处理（例如使用OCRmyPDF）后再尝试。",
+                    "未能从所选文件中提取任何文本内容。若为扫描版PDF，请先进行OCR处理（例如使用OCRmyPDF）后再尝试。",
                     gr.update(interactive=True),
                     state,
                 )
                 return
 
-            yield "3/3: 正在创建向量索引...", gr.update(interactive=False), state
-            vs = FAISS.from_documents(chunks, embeddings)
             _save_faiss_to_cache(cache_dir, vs)
 
         state["rag_retriever"] = vs.as_retriever(search_kwargs={"k": int(top_k)})
@@ -349,7 +374,10 @@ def process_uploaded_file(
         state["last_file_key"] = file_key
         state["agent_built_for_file_key"] = file_key
 
-        yield f"文件 '{os.path.basename(file_path)}' 处理成功！", gr.update(interactive=True), state
+        if len(files) > 1:
+            yield f"已处理并合并 {len(files)} 个文件（新增 {total_chunks} 个片段）。", gr.update(interactive=True), state
+        else:
+            yield f"文件 '{os.path.basename(single_path)}' 处理成功！", gr.update(interactive=True), state
 
     except Exception as e:
         traceback.print_exc()
@@ -385,6 +413,90 @@ def chat_with_agent(question: str, history: list, state: Dict[str, Any]) -> str:
         return f"发生错误: {e}"
 
 
+def process_more_files(
+    files,
+    state: Dict[str, Any],
+    chunk_size: int,
+    chunk_overlap: int,
+    top_k: int,
+    persist_dir_text: str,
+) -> Generator[Tuple[str, Dict[str, Any]], None, None]:
+    """追加上传多个文件，将内容合并到当前向量索引中。"""
+    if not files:
+        yield "请先选择要追加的文件。", state
+        return
+
+    try:
+        base_cache_dir = _get_base_cache_dir(persist_dir_text)
+        emb_fp = _embeddings_fingerprint(embeddings)
+
+        # 优先使用现有索引目录
+        cache_dir = state.get("last_index_cache_dir")
+        if not cache_dir or not os.path.isdir(cache_dir):
+            # 使用一个稳定的“会话合并”目录
+            cache_dir = os.path.join(base_cache_dir, f"combined__{emb_fp[:12]}")
+
+        # 尝试加载已有索引
+        vs = _try_load_faiss_from_cache(cache_dir)
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size, chunk_overlap=chunk_overlap
+        )
+
+        total_chunks = 0
+        for f in files:
+            try:
+                file_path = f.name
+            except Exception:
+                file_path = str(f)
+            file_ext = os.path.splitext(file_path)[1].lower()
+            yield f"正在处理: {os.path.basename(file_path)}...", state
+
+            # 加载文档
+            if file_ext == ".pdf":
+                documents = _load_pdf_with_fallbacks(file_path)
+                if not documents:
+                    continue
+            elif file_ext == ".txt":
+                loader = TextLoader(file_path, encoding="utf-8")
+                documents = loader.load()
+            elif file_ext == ".docx":
+                loader = Docx2txtLoader(file_path)
+                documents = loader.load()
+            else:
+                continue
+
+            # 切分
+            chunks = splitter.split_documents(documents)
+            if not chunks:
+                continue
+            total_chunks += len(chunks)
+
+            # 创建或追加到索引
+            if vs is None:
+                vs = FAISS.from_documents(chunks, embeddings)
+            else:
+                vs.add_documents(chunks)
+
+        if vs is None:
+            yield "未能从所选文件中提取可用文本内容。", state
+            return
+
+        # 保存并更新会话
+        _save_faiss_to_cache(cache_dir, vs)
+        state["rag_retriever"] = vs.as_retriever(search_kwargs={"k": int(top_k)})
+        state["agent_executor"] = build_agent(state["rag_retriever"])
+        state["last_index_cache_dir"] = cache_dir
+        state["last_file_key"] = "combined"
+        state["agent_built_for_file_key"] = "combined"
+
+        yield f"已追加完成（新增 {total_chunks} 个片段）。", state
+
+    except Exception as e:
+        traceback.print_exc()
+        yield f"追加失败: {e}", state
+
+
 def clear_cache(persist_dir_text: str, state: Dict[str, Any]):
     try:
         base_cache_dir = _get_base_cache_dir(persist_dir_text)
@@ -411,7 +523,9 @@ def build_ui():
                 gr.Markdown("### ▲ 上传业务文档")
 
                 file_uploader = gr.File(
-                    label="选择或拖拽文件 (支持TXT/PDF/DOCX)", file_types=[".txt", ".pdf", ".docx"]
+                    label="选择或拖拽文件 (支持多选：TXT/PDF/DOCX)",
+                    file_types=[".txt", ".pdf", ".docx"],
+                    file_count="multiple",
                 )
 
                 with gr.Row():
@@ -452,6 +566,12 @@ def build_ui():
 
         with gr.Column(scale=2):
             gr.Markdown("### 对话窗口")
+            with gr.Row():
+                more_files = gr.File(
+                    label="追加上传文档 (支持多选)", file_types=[".txt", ".pdf", ".docx"], file_count="multiple"
+                )
+                more_files_btn = gr.Button("上传更多文档（追加到当前索引）", variant="secondary")
+            more_status = gr.Markdown()
 
         gr.ChatInterface(
             fn=chat_with_agent,
@@ -474,6 +594,12 @@ def build_ui():
             fn=clear_cache,
             inputs=[persist_dir, session_state],
             outputs=[status_display, session_state],
+        )
+
+        more_files_btn.click(
+            fn=process_more_files,
+            inputs=[more_files, session_state, chunk_size, chunk_overlap, top_k, persist_dir],
+            outputs=[more_status, session_state],
         )
 
         demo.queue()
