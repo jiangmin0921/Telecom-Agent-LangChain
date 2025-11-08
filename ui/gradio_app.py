@@ -30,10 +30,24 @@ def _default_session_state() -> Dict[str, Any]:
 
 
 def _get_default_base_cache_dir() -> str:
+    """
+    获取默认缓存目录
+    优先级：环境变量 RAG_FAISS_DIR > 项目目录下的 .rag_faiss_cache > 用户目录下的 .rag_faiss_cache
+    """
+    # 首先检查环境变量
     env_dir = os.getenv("RAG_FAISS_DIR")
     if env_dir and env_dir.strip():
         return os.path.expanduser(env_dir.strip())
-    return os.path.join(os.path.expanduser("~"), ".rag_faiss_cache")
+    
+    # 获取项目根目录（当前工作目录）
+    project_root = os.getcwd()
+    # 在项目目录下创建缓存文件夹
+    project_cache_dir = os.path.join(project_root, ".rag_faiss_cache")
+    
+    # 确保目录存在
+    os.makedirs(project_cache_dir, exist_ok=True)
+    
+    return project_cache_dir
 
 
 def _get_base_cache_dir(persist_dir_text: Optional[str]) -> str:
@@ -722,8 +736,9 @@ def build_ui():
 
                 with gr.Accordion("高级设置", open=False):
                     persist_dir = gr.Textbox(
-                        label="索引持久化目录 (留空使用 RAG_FAISS_DIR 或 ~/.rag_faiss_cache)",
+                        label="索引持久化目录 (留空使用项目目录下的 .rag_faiss_cache 文件夹)",
                         value=_get_default_base_cache_dir(),
+                        placeholder="留空则使用项目目录下的 .rag_faiss_cache 文件夹",
                     )
                     clear_cache_btn = gr.Button("清理缓存", variant="secondary")
 
